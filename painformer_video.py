@@ -149,41 +149,41 @@ class SpectralGatingNetwork(nn.Module):
         """
         x : [B, T*H*W, C]
         returns: [B, T*H*W, C]
+
+        Factorised spectral gating — two sequential passes, each fully
+        completed before the next starts so inputs are always real:
+          Pass 1 (spatial) : rfft2 → multiply → irfft2  → real output
+          Pass 2 (temporal): rfft  → multiply → irfft   → real output
         """
         B, _N, C = x.shape                               # [B, T*H*W, C]
 
-        # --- Reshape to [B, T, H, W, C] ---
         x = x.view(B, T, H, W, C)                        # [B, T, H, W, C]
-        x = x.to(torch.float32)
+        x = x.to(torch.float32)                          # ensure real float32
 
-        # ── Step 1: Spatial rfft2 over (H, W) ─────────────────────────────
-        # Flatten (B, T) into a single leading dim for the 2-D FFT
-        x = x.reshape(B * T, H, W, C)                    # [B*T, H, W, C]
-        x = torch.fft.rfft2(x, dim=(1, 2), norm='ortho') # [B*T, H, W//2+1, C]
+        # ── Pass 1: Spatial filter ─────────────────────────────────────────
+        # Flatten (B,T) so rfft2 sees (B*T) independent 2-D frames.
+        x = x.reshape(B * T, H, W, C)                    # [B*T, H, W, C]       real
+        x = torch.fft.rfft2(x, dim=(1, 2), norm='ortho') # [B*T, H, W//2+1, C]  complex
 
-        # Multiply by spatial weight  [H, W//2+1, C]
         w_spatial = torch.view_as_complex(self.complex_weight)  # [H, W//2+1, C]
-        x = x * w_spatial                                 # [B*T, H, W//2+1, C]
+        x = x * w_spatial                                 # [B*T, H, W//2+1, C]  complex
 
-        # ── Step 2: Temporal rfft along T ─────────────────────────────────
-        W_rfft = x.shape[2]                               # W//2+1
-        x = x.view(B, T, H, W_rfft, C)                   # [B, T, H, W_rfft, C]
-        x = torch.fft.rfft(x, dim=1, norm='ortho')       # [B, T_freq, H, W_rfft, C]
+        # irfft2 brings x back to real — temporal rfft requires real input
+        x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm='ortho')  # [B*T, H, W, C]  real
 
-        # Multiply by temporal weight  [T_freq, C] → broadcast over (B, H, W_rfft)
+        # ── Pass 2: Temporal filter ────────────────────────────────────────
+        # x is real here so rfft is valid.
+        x = x.view(B, T, H, W, C)                        # [B, T, H, W, C]      real
+        x = torch.fft.rfft(x, dim=1, norm='ortho')       # [B, T_freq, H, W, C] complex
+
         w_temporal = torch.view_as_complex(self.temporal_weight)  # [T_freq, C]
-        # unsqueeze to [1, T_freq, 1, 1, C] for broadcasting
-        x = x * w_temporal.unsqueeze(0).unsqueeze(2).unsqueeze(3)  # [B, T_freq, H, W_rfft, C]
+        # broadcast over (B, H, W)
+        x = x * w_temporal.unsqueeze(0).unsqueeze(2).unsqueeze(3)  # [B, T_freq, H, W, C]
 
-        # ── Step 3: Temporal irfft ─────────────────────────────────────────
-        x = torch.fft.irfft(x, n=T, dim=1, norm='ortho') # [B, T, H, W_rfft, C]
-
-        # ── Step 4: Spatial irfft2 ─────────────────────────────────────────
-        x = x.reshape(B * T, H, W_rfft, C)               # [B*T, H, W_rfft, C]
-        x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm='ortho')  # [B*T, H, W, C]
+        x = torch.fft.irfft(x, n=T, dim=1, norm='ortho')  # [B, T, H, W, C]  real
 
         # ── Reshape back ───────────────────────────────────────────────────
-        x = x.reshape(B, T * H * W, C)                   # [B, T*H*W, C]
+        x = x.reshape(B, T * H * W, C)                    # [B, T*H*W, C]
         return x
 
 
