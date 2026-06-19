@@ -531,8 +531,8 @@ class Stem(nn.Module):
         self.conv = nn.Sequential(
             # conv1: strong spatial downsampling 224 → 112
             nn.Conv3d(in_channels, hd,
-                      kernel_size=(1, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3),
-                      bias=False),
+                      kernel_size=(1, 7, 7), stride=(1, 2, 2), padding=(0, 3, 3),
+                      bias=False),  # temporal pad=0 → T preserved (kernel_t=1 needs no temporal pad)
             nn.BatchNorm3d(hd),
             nn.ReLU(inplace=True),
 
