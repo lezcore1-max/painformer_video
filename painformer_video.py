@@ -125,13 +125,9 @@ class SpectralGatingNetwork(nn.Module):
             self.h, self.w = 56, 29           # H, (W/2)+1
         elif dim == 128:
             self.h, self.w = 28, 15           # H, (W/2)+1
-        elif dim == 96:
-            self.h, self.w = 56, 29
-        elif dim == 192:
-            self.h, self.w = 28, 15
         else:
             raise ValueError(f"SpectralGatingNetwork: unsupported dim={dim}. "
-                             "Expected one of 64, 96, 128, 192.")
+                             "Expected one of {64, 128}.")
 
         # Spatial learnable weight: [H, W_rfft, C, 2(re/im)]
         self.complex_weight = nn.Parameter(
@@ -149,41 +145,41 @@ class SpectralGatingNetwork(nn.Module):
         """
         x : [B, T*H*W, C]
         returns: [B, T*H*W, C]
-
-        Factorised spectral gating — two sequential passes, each fully
-        completed before the next starts so inputs are always real:
-          Pass 1 (spatial) : rfft2 → multiply → irfft2  → real output
-          Pass 2 (temporal): rfft  → multiply → irfft   → real output
         """
         B, _N, C = x.shape                               # [B, T*H*W, C]
 
+        # --- Reshape to [B, T, H, W, C] ---
         x = x.view(B, T, H, W, C)                        # [B, T, H, W, C]
-        x = x.to(torch.float32)                          # ensure real float32
+        x = x.to(torch.float32)
 
-        # ── Pass 1: Spatial filter ─────────────────────────────────────────
-        # Flatten (B,T) so rfft2 sees (B*T) independent 2-D frames.
-        x = x.reshape(B * T, H, W, C)                    # [B*T, H, W, C]       real
-        x = torch.fft.rfft2(x, dim=(1, 2), norm='ortho') # [B*T, H, W//2+1, C]  complex
+        # ── Step 1: Spatial rfft2 over (H, W) ─────────────────────────────
+        # Flatten (B, T) into a single leading dim for the 2-D FFT
+        x = x.reshape(B * T, H, W, C)                    # [B*T, H, W, C]
+        x = torch.fft.rfft2(x, dim=(1, 2), norm='ortho') # [B*T, H, W//2+1, C]
 
+        # Multiply by spatial weight  [H, W//2+1, C]
         w_spatial = torch.view_as_complex(self.complex_weight)  # [H, W//2+1, C]
-        x = x * w_spatial                                 # [B*T, H, W//2+1, C]  complex
+        x = x * w_spatial                                 # [B*T, H, W//2+1, C]
 
-        # irfft2 brings x back to real — temporal rfft requires real input
-        x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm='ortho')  # [B*T, H, W, C]  real
+        # ── Step 2: Temporal rfft along T ─────────────────────────────────
+        W_rfft = x.shape[2]                               # W//2+1
+        x = x.view(B, T, H, W_rfft, C)                   # [B, T, H, W_rfft, C]
+        x = torch.fft.rfft(x, dim=1, norm='ortho')       # [B, T_freq, H, W_rfft, C]
 
-        # ── Pass 2: Temporal filter ────────────────────────────────────────
-        # x is real here so rfft is valid.
-        x = x.view(B, T, H, W, C)                        # [B, T, H, W, C]      real
-        x = torch.fft.rfft(x, dim=1, norm='ortho')       # [B, T_freq, H, W, C] complex
-
+        # Multiply by temporal weight  [T_freq, C] → broadcast over (B, H, W_rfft)
         w_temporal = torch.view_as_complex(self.temporal_weight)  # [T_freq, C]
-        # broadcast over (B, H, W)
-        x = x * w_temporal.unsqueeze(0).unsqueeze(2).unsqueeze(3)  # [B, T_freq, H, W, C]
+        # unsqueeze to [1, T_freq, 1, 1, C] for broadcasting
+        x = x * w_temporal.unsqueeze(0).unsqueeze(2).unsqueeze(3)  # [B, T_freq, H, W_rfft, C]
 
-        x = torch.fft.irfft(x, n=T, dim=1, norm='ortho')  # [B, T, H, W, C]  real
+        # ── Step 3: Temporal irfft ─────────────────────────────────────────
+        x = torch.fft.irfft(x, n=T, dim=1, norm='ortho') # [B, T, H, W_rfft, C]
+
+        # ── Step 4: Spatial irfft2 ─────────────────────────────────────────
+        x = x.reshape(B * T, H, W_rfft, C)               # [B*T, H, W_rfft, C]
+        x = torch.fft.irfft2(x, s=(H, W), dim=(1, 2), norm='ortho')  # [B*T, H, W, C]
 
         # ── Reshape back ───────────────────────────────────────────────────
-        x = x.reshape(B, T * H * W, C)                    # [B, T*H*W, C]
+        x = x.reshape(B, T * H * W, C)                   # [B, T*H*W, C]
         return x
 
 
@@ -379,28 +375,31 @@ class Attention(nn.Module):
         # Reshape: treat (B*T) as the batch, N = H*W as the sequence
         x_s = x.view(B * T, N, C)                        # [B*T, N, C]
         x_s_out, attn_spatial = self._mhsa(              # [B*T, N, C], [B*T, nh, N, N]
-            x_s, self.q_s, self.kv_s, self.proj_s)
+            x_s, self.q_s, self.kv_s, self.proj_s)       # x_s_out is Delta_s
 
-        # First residual: spatial
-        x_s = x_s + x_s_out                              # [B*T, N, C]
-        x_s = x_s.view(B, T * N, C)                      # [B, T*H*W, C]
+        # Feed spatially attended representation into temporal pass (x + Delta_s)
+        x_mid = x_s + x_s_out                            # [B*T, N, C]
 
         # ── Temporal attention ─────────────────────────────────────────────
         # Reshape: treat (B*N) as the batch, T as the sequence
-        x_t = x_s.view(B, T, N, C)                       # [B, T, H*W, C]
+        x_t = x_mid.view(B, T, N, C)                     # [B, T, H*W, C]
         x_t = x_t.permute(0, 2, 1, 3)                    # [B, N, T, C]
         x_t = x_t.reshape(B * N, T, C)                   # [B*N, T, C]
 
         x_t_out, _attn_temporal = self._mhsa(            # [B*N, T, C]
-            x_t, self.q_t, self.kv_t, self.proj_t)
+            x_t, self.q_t, self.kv_t, self.proj_t)       # x_t_out is Delta_t
 
-        # Second residual: temporal
-        x_t = x_t + x_t_out                              # [B*N, T, C]
-        x_t = x_t.view(B, N, T, C)                       # [B, N, T, C]
-        x_t = x_t.permute(0, 2, 1, 3)                    # [B, T, N, C]
-        x_t = x_t.reshape(B, T * N, C)                   # [B, T*H*W, C]
+        # Delta_s reshape
+        delta_s = x_s_out.view(B, T * N, C)              # [B, T*N, C]
 
-        return x_t, attn_spatial                         # [B, T*H*W, C], attn
+        # Delta_t reshape
+        delta_t = x_t_out.view(B, N, T, C)               # [B, N, T, C]
+        delta_t = delta_t.permute(0, 2, 1, 3)            # [B, T, N, C]
+        delta_t = delta_t.reshape(B, T * N, C)           # [B, T*N, C]
+
+        # Return only the spatial delta + temporal delta to Block
+        attn_out = delta_s + delta_t                     # [B, T*N, C]
+        return attn_out, attn_spatial                    # [B, T*N, C], attn
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +516,7 @@ class Stem(nn.Module):
     Output : ([B, T*H_out*W_out, C],  H_out, W_out, T)
 
     Conv3d kernel/stride/padding:
-      conv1 : k=(1,7,7)  s=(1,2,2)  p=(1,3,3)   224 → 112
+      conv1 : k=(1,7,7)  s=(1,2,2)  p=(0,3,3)   224 → 112
       conv2 : k=(1,3,3)  s=(1,1,1)  p=(0,1,1)   112 → 112
       conv3 : k=(1,3,3)  s=(1,1,1)  p=(0,1,1)   112 → 112
       proj  : k=(1,3,3)  s=(1,2,2)  p=(0,1,1)   112 → 56
@@ -531,8 +530,8 @@ class Stem(nn.Module):
         self.conv = nn.Sequential(
             # conv1: strong spatial downsampling 224 → 112
             nn.Conv3d(in_channels, hd,
-                      kernel_size=(1, 7, 7), stride=(1, 2, 2), padding=(0, 3, 3),
-                      bias=False),  # temporal pad=0 → T preserved (kernel_t=1 needs no temporal pad)
+                      kernel_size=(1, 7, 7), stride=(1, 2, 2), padding=(1, 3, 3),
+                      bias=False),
             nn.BatchNorm3d(hd),
             nn.ReLU(inplace=True),
 
@@ -816,7 +815,7 @@ class SpectFormer(nn.Module):
 # ---------------------------------------------------------------------------
 
 @register_model
-def painformer(pretrained=False, T=8, **kwargs):
+def painformer_video(pretrained=False, T=8, **kwargs):
     """
     PainFormer video encoder (spatiotemporal).
 
@@ -858,7 +857,7 @@ if __name__ == "__main__":
     print(f"Device: {device}")
 
     # Build model
-    model = painformer(T=8, num_classes=4).to(device)
+    model = painformer_video(T=8, num_classes=4).to(device)
     model.eval()
 
     # Dummy video input: [B=2, T=8, C=3, H=224, W=224]
